@@ -15,6 +15,7 @@ class _JadwalSholatPageState extends State<JadwalSholatPage> {
   Map<String, DateTime?> prayerTimes = {};
   bool loading = true;
   bool adzanEnabled = false;
+  bool isPlaying = false;
   String currentLocation = '';
   late AudioPlayer _audioPlayer;
   Timer? _checkPrayerTimeTimer;
@@ -24,7 +25,7 @@ class _JadwalSholatPageState extends State<JadwalSholatPage> {
     super.initState();
     _audioPlayer = AudioPlayer();
     _loadAdzanSetting();
-    _getPrayerTimes();
+    _requestLocationAndLoadPrayerTimes();
   }
 
   @override
@@ -49,50 +50,66 @@ class _JadwalSholatPageState extends State<JadwalSholatPage> {
     });
   }
 
-  Future<void> _getPrayerTimes() async {
+  Future<void> _requestLocationAndLoadPrayerTimes() async {
     setState(() => loading = true);
 
+    bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      _showEnableLocationDialog();
+      await _loadPrayerTimes(-6.2088, 106.8456, fallback: true);
+      return;
+    }
+
+    LocationPermission permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+    }
+
+    if (permission == LocationPermission.denied ||
+        permission == LocationPermission.deniedForever) {
+      await _loadPrayerTimes(-6.2088, 106.8456, fallback: true);
+      return;
+    }
+
     try {
-      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-      if (!serviceEnabled) throw Exception('Location service disabled');
-
-      LocationPermission permission = await Geolocator.checkPermission();
-      if (permission == LocationPermission.denied) {
-        permission = await Geolocator.requestPermission();
-        if (permission == LocationPermission.denied) {
-          throw Exception('Permission denied');
-        }
-      }
-
-      if (permission == LocationPermission.deniedForever) {
-        throw Exception('Permission denied forever');
-      }
-
-      Position position = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.high,
-      );
-
+      Position position = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
       await _loadPrayerTimes(position.latitude, position.longitude);
     } catch (_) {
-      await _loadPrayerTimes(-6.2088, 106.8456, fallback: true); // Jakarta
+      await _loadPrayerTimes(-6.2088, 106.8456, fallback: true);
     }
+  }
+
+  void _showEnableLocationDialog() {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text('Lokasi Tidak Aktif'),
+        content: Text('Aktifkan layanan lokasi untuk mendapatkan jadwal sholat sesuai lokasi Anda. Jika tidak, akan digunakan lokasi default (Jakarta).'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: Text('OK'),
+          )
+        ],
+      ),
+    );
   }
 
   Future<void> _loadPrayerTimes(double lat, double lon, {bool fallback = false}) async {
     final coordinates = Coordinates(lat, lon);
     final params = CalculationMethod.muslim_world_league.getParameters();
     params.madhab = Madhab.shafi;
-
     final prayerTimesObj = PrayerTimes.today(coordinates, params);
 
-    String city = '';
-    String country = '';
+    String locationName = fallback ? 'Jakarta, Indonesia (default)' : '';
     if (!fallback) {
       try {
         List<Placemark> placemarks = await placemarkFromCoordinates(lat, lon);
-        city = placemarks.first.locality ?? '';
-        country = placemarks.first.country ?? '';
-      } catch (_) {}
+        final place = placemarks.first;
+        locationName = "${place.locality ?? ''}, ${place.country ?? ''}";
+      } catch (_) {
+        locationName = 'Lokasi tidak diketahui';
+      }
     }
 
     setState(() {
@@ -103,9 +120,7 @@ class _JadwalSholatPageState extends State<JadwalSholatPage> {
         'Maghrib': prayerTimesObj.maghrib,
         'Isya': prayerTimesObj.isha,
       };
-      currentLocation = fallback
-          ? 'Jakarta, Indonesia (default)'
-          : (city.isNotEmpty ? '$city, $country' : 'Lokasi tidak diketahui');
+      currentLocation = locationName;
       loading = false;
     });
 
@@ -113,15 +128,16 @@ class _JadwalSholatPageState extends State<JadwalSholatPage> {
   }
 
   void _startPrayerTimeChecker() {
-    _checkPrayerTimeTimer = Timer.periodic(Duration(minutes: 1), (_) {
-      if (!adzanEnabled) return;
+    _checkPrayerTimeTimer?.cancel();
+    _checkPrayerTimeTimer = Timer.periodic(Duration(seconds: 30), (_) {
+      if (!adzanEnabled || isPlaying) return;
 
       final now = DateTime.now();
       for (var time in prayerTimes.values) {
         if (time != null &&
             now.hour == time.hour &&
             now.minute == time.minute &&
-            now.second < 10) {
+            now.second < 30) {
           _playAdzan();
           break;
         }
@@ -129,9 +145,19 @@ class _JadwalSholatPageState extends State<JadwalSholatPage> {
     });
   }
 
-  void _playAdzan() async {
+  Future<void> _playAdzan() async {
     if (!adzanEnabled) return;
     await _audioPlayer.play(AssetSource('audio/adzan.mp3'));
+    setState(() {
+      isPlaying = true;
+    });
+  }
+
+  Future<void> _stopAdzan() async {
+    await _audioPlayer.stop();
+    setState(() {
+      isPlaying = false;
+    });
   }
 
   String _formatTime(DateTime? time) {
@@ -170,95 +196,76 @@ class _JadwalSholatPageState extends State<JadwalSholatPage> {
         child: loading
             ? Center(child: CircularProgressIndicator(color: Colors.white))
             : SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Text(
-                      'Jadwal Sholat',
-                      style: TextStyle(
-                        fontSize: 28,
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    Spacer(),
-                    Row(
-                      children: [
-                        Text('Adzan', style: TextStyle(color: Colors.white)),
-                        Switch(
-                          value: adzanEnabled,
-                          onChanged: (val) => _setAdzanSetting(val),
-                          activeColor: Colors.white,
-                        ),
-                      ],
-                    )
-                  ],
-                ),
-                Text(
-                  currentLocation,
-                  style: TextStyle(fontSize: 18, color: Colors.white70),
-                ),
-                SizedBox(height: 24),
-                Expanded(
-                  child: ListView(
-                    children: prayerTimes.entries.map((entry) {
-                      return Card(
-                        shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(16)),
-                        elevation: 4,
-                        margin: EdgeInsets.symmetric(vertical: 8),
-                        child: ListTile(
-                          leading: Icon(
-                            _getIconForPrayer(entry.key),
-                            color: Colors.teal,
-                            size: 30,
-                          ),
-                          title: Text(
-                            entry.key,
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Text(
+                            'Jadwal Sholat',
                             style: TextStyle(
-                                fontSize: 20,
-                                fontWeight: FontWeight.w600),
+                              fontSize: 28,
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold,
+                            ),
                           ),
-                          trailing: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Text(
-                                _formatTime(entry.value),
-                                style: TextStyle(
-                                    fontSize: 18,
-                                    fontWeight: FontWeight.bold),
-                              ),
-                              const SizedBox(width: 8),
-                              IconButton(
-                                icon: Icon(Icons.volume_up,
-                                    color: Colors.teal),
-                                onPressed: () {
-                                  if (adzanEnabled) {
-                                    _playAdzan();
-                                  } else {
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      SnackBar(
-                                        content: Text("Aktifkan audio adzan terlebih dahulu."),
+                          Spacer(),
+                          Switch(
+                            value: adzanEnabled,
+                            onChanged: _setAdzanSetting,
+                            activeColor: Colors.white,
+                          ),
+                          Icon(Icons.volume_up, color: Colors.white),
+                        ],
+                      ),
+                      Text(
+                        currentLocation,
+                        style: TextStyle(fontSize: 18, color: Colors.white70),
+                      ),
+                      SizedBox(height: 20),
+                      Expanded(
+                        child: ListView(
+                          children: prayerTimes.entries.map((entry) {
+                            return Card(
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                              elevation: 4,
+                              margin: EdgeInsets.symmetric(vertical: 8),
+                              child: ListTile(
+                                leading: Icon(_getIconForPrayer(entry.key), color: Colors.teal, size: 30),
+                                title: Text(entry.key, style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600)),
+                                trailing: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(_formatTime(entry.value),
+                                        style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                                    IconButton(
+                                      icon: Icon(
+                                        isPlaying ? Icons.stop : Icons.volume_up,
+                                        color: Colors.teal,
                                       ),
-                                    );
-                                  }
-                                },
+                                      onPressed: () {
+                                        if (!adzanEnabled) {
+                                          ScaffoldMessenger.of(context).showSnackBar(
+                                            SnackBar(content: Text("Aktifkan adzan dulu.")),
+                                          );
+                                        } else {
+                                          isPlaying ? _stopAdzan() : _playAdzan();
+                                        }
+                                      },
+                                    )
+                                  ],
+                                ),
                               ),
-                            ],
-                          ),
+                            );
+                          }).toList(),
                         ),
-                      );
-                    }).toList(),
+                      ),
+                    ],
                   ),
                 ),
-              ],
-            ),
-          ),
-        ),
+              ),
       ),
     );
   }
